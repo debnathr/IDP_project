@@ -3,12 +3,14 @@
 运行：python -m unittest tests.test_run_cqf -v
 """
 
+import csv
 import os
 import shutil
 import tempfile
 import unittest
 from unittest import mock
 
+import run_comparison
 import run_cqf
 from cqf import validate
 
@@ -42,6 +44,25 @@ class TestRunCqf(unittest.TestCase):
         for prefix in ('export_log_', 'res_', 'queues_', 'summary_', 'time1_time_'):
             self.assertTrue(any(n.startswith(prefix) for n in names), (prefix, names))
         self.assertFalse(any(n.startswith('FAILED_') for n in names))
+
+    def test_load_greedy_and_mask_density_in_summary(self):
+        self.assertEqual(run_cqf.main(self._argv('--algo', 'greedy_load')), 0)
+        summary = [n for n in self._files() if n.startswith('summary_')][0]
+        self.assertIn('greedy_load', summary)
+        with open(os.path.join(self.results, summary), encoding='utf-8') as f:
+            text = f.read()
+        self.assertIn('mask density', text)
+        self.assertIn('order_seed: 10000', text)          # 默认 order_seed = seed + 10000
+
+    def test_order_seed_is_independent_of_scheduler_seed(self):
+        # 随机顺序只由 order_seed 决定：默认 seed + 10000，显式给 --order-seed 时用它
+        import random
+        from cqf.algorithms import order_streams
+        for extra, expected_seed in ((['--seed', '5'], 10005), (['--seed', '5', '--order-seed', '3'], 3)):
+            model, result, ok = run_cqf.run_one(1, run_cqf.parse_args(self._argv('--order', 'random', *extra)))
+            self.assertTrue(ok)
+            expected = [s.id for s in order_streams(model.streams, 'random', random.Random(expected_seed))]
+            self.assertEqual(result.order, expected)
 
     def test_validation_failure_blocks_exports_and_exit_1(self):
         broken = {'ok': False, 'problems': ['injected failure'], 'queues': {}}
@@ -81,6 +102,50 @@ class TestRunCqf(unittest.TestCase):
             run_cqf.main(self._argv('--max-offset', '0'))     # 完全相同的配置再跑一次
         summaries = [n for n in self._files() if n.startswith('summary_')]
         self.assertEqual(len(summaries), 3)
+
+
+class TestRunComparison(unittest.TestCase):
+    """run_comparison.py：随机（多 seed）/ 贪心 / 负载贪心在玩具用例上跑齐，写出 Markdown 表与 csv。不给 --mlp / --gat 时没有策略列。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.data = os.path.join(self.tmp, 'data')
+        self.results = os.path.join(self.tmp, 'results')
+        os.makedirs(self.data)
+        with open(os.path.join(self.data, 'TC1_topo.txt'), 'w', encoding='utf-8') as f:
+            f.write('\n'.join(TOPO_LINES) + '\n')
+        with open(os.path.join(self.data, 'TC1_flows.txt'), 'w', encoding='utf-8') as f:
+            f.write(flow(0, 'esA', 'esB', 1000, 800, 500) + '\n' + flow(1, 'esC', 'esB', 2500, 900, 600) + '\n')
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def test_table_csv_and_test_total_row(self):
+        out = os.path.join(self.tmp, 'cmp.md')
+        rc = run_comparison.main(['--tc', '1', '--cycle', '100', '--seeds', '2', '--test-tc', '1',
+                                  '--data-dir', self.data, '--results-dir', self.results, '--out', out])
+        self.assertEqual(rc, 0)
+        with open(out, encoding='utf-8') as f:
+            text = f.read()
+        self.assertIn('| 1 | test | 2 | 2.0 ± 0.0 | 2 | 2 |', text)          # 两条玩具流全部接纳
+        self.assertIn('| **test total** | **1** | **2** |', text)             # --test-tc 1 -> 有加总行
+        self.assertNotIn('MLP (PPO)', text)
+        with open(os.path.join(self.tmp, 'cmp.csv'), encoding='utf-8') as f:
+            rows = list(csv.DictReader(f))
+        self.assertEqual([r['label'] for r in rows], ['random', 'random', 'greedy', 'greedy_load'])
+        self.assertEqual([r['seed'] for r in rows], ['0', '1', '0', '0'])
+        self.assertTrue(all(r['order'] == 'input' for r in rows))
+        self.assertTrue(any(n.startswith('summary_') and '_cmp' in n for n in os.listdir(self.results)))
+
+    def test_without_test_tc_there_is_no_total_row(self):
+        out = os.path.join(self.tmp, 'cmp.md')
+        rc = run_comparison.main(['--tc', '1', '--cycle', '100', '--seeds', '1',
+                                  '--data-dir', self.data, '--results-dir', self.results, '--out', out])
+        self.assertEqual(rc, 0)
+        with open(out, encoding='utf-8') as f:
+            text = f.read()
+        self.assertIn('| 1 | smoke | 2 | 2 | 2 | 2 |', text)                  # 单 seed 时随机列不带 ±
+        self.assertNotIn('test total', text)
 
 
 if __name__ == '__main__':

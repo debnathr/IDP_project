@@ -20,6 +20,7 @@ class ScheduleResult:
     order: list = field(default_factory=list)       # 实际处理流的顺序（流 id）
     scheduled: list = field(default_factory=list)   # 成功接纳的流 id（按接纳顺序）
     rejected: dict = field(default_factory=dict)    # 被拒绝的流 id -> 原因：'deadline' / 'capacity' / 'no_path'
+    feasible_counts: dict = field(default_factory=dict)  # 流 id -> 轮到它时可行 (route, offset) 组合数（0 = 被拒绝）；掩码密度的原始数据
     runtime_s: float = 0.0                          # 调度耗时（秒）
 
 
@@ -63,6 +64,9 @@ class SchedulerBase:
         """从可行组合 feasible（[(path_idx, offset), ...]，非空）里选一个返回。"""
         raise NotImplementedError
 
+    def after_commit(self, model, stream, path_idx, offset):
+        """commit 之后的钩子，默认什么都不做。需要维护自己状态镜像的算法（PPO 的特征表）覆盖它。"""
+
     def run(self, model, ordered_streams):
         """按 ordered_streams 的顺序逐条处理：枚举可行组合 -> choose -> commit。"""
         result = ScheduleResult()
@@ -70,11 +74,13 @@ class SchedulerBase:
         for stream in ordered_streams:
             result.order.append(stream.id)
             feasible, reasons = model.feasible_actions(stream)
+            result.feasible_counts[stream.id] = len(feasible)
             if not feasible:
                 result.rejected[stream.id] = classify_rejection(model, stream, reasons)
                 continue
             path_idx, offset = self.choose(model, stream, feasible)
             model.commit(stream, path_idx, offset)
+            self.after_commit(model, stream, path_idx, offset)
             result.scheduled.append(stream.id)
         result.runtime_s = time.perf_counter() - t0
         return result

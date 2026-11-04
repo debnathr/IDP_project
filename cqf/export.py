@@ -32,6 +32,7 @@ TC 编号、总流数、成功调度数、调度率、运行时间。
 """
 
 import os
+import statistics
 
 from .model import queue_number
 
@@ -167,6 +168,41 @@ def write_time_file(results_dir, tc_number, t_start, t_stop, run_name=''):
     return path
 
 
+def mask_density_stats(model, result):
+    """掩码密度：每条流轮到它时的可行 (route, offset) 组合数，除以它的候选组合数（候选路径数 × offset 个数）。
+    这是 RL 难度的一个度量：密度越低，可选的动作越少；为 0 的流不经过策略直接被拒绝。
+    返回 dict：mean_feasible / median_feasible / max_feasible / mean_density / zero_feasible / n_flows；
+    result 里没有 feasible_counts（旧结果）时返回 None。"""
+    if not result.feasible_counts:
+        return None
+    counts, densities = [], []
+    for stream in model.streams:
+        n = result.feasible_counts.get(stream.id, 0)
+        candidates = len(model.paths[stream.id]) * len(model.offset_range(stream))
+        counts.append(n)
+        densities.append(n / candidates if candidates else 0.0)
+    return {
+        'n_flows': len(counts),
+        'mean_feasible': statistics.fmean(counts),
+        'median_feasible': statistics.median(counts),
+        'max_feasible': max(counts),
+        'mean_density': statistics.fmean(densities),
+        'zero_feasible': sum(1 for n in counts if n == 0),
+    }
+
+
+def mask_density_lines(model, result):
+    stats = mask_density_stats(model, result)
+    if stats is None:
+        return []
+    return [
+        'feasible actions per flow (mean / median / max): %.1f / %g / %d' % (
+            stats['mean_feasible'], stats['median_feasible'], stats['max_feasible']),
+        'mask density (feasible / candidate actions, mean): %.4f' % stats['mean_density'],
+        'flows with no feasible action: %d' % stats['zero_feasible'],
+    ]
+
+
 def write_summary(results_dir, run_name, tc_number, model, result, runtime_s, extra=None):
     """写 summary_<run>.txt：导师 TC_conditions.txt 要求的汇总（TC 编号、总流数、成功数、调度率、时间）。"""
     total = len(model.streams)
@@ -186,6 +222,7 @@ def write_summary(results_dir, run_name, tc_number, model, result, runtime_s, ex
         'rejected (no_path): %d' % sum(1 for r in result.rejected.values() if r == 'no_path'),
         'check() calls: %d' % model.n_checks,
     ]
+    lines.extend(mask_density_lines(model, result))
     for key, value in (extra or {}).items():
         lines.append('%s: %s' % (key, value))
     path = os.path.join(results_dir, 'summary_%s.txt' % run_name)

@@ -1,8 +1,9 @@
 """主入口（对应 gasa 的 mcqf_master.py）：读取导师测试集 -> 建图建模 -> 运行算法 -> 验证 -> 导出。
 
 用法示例：
-    python run_cqf.py --tc 1 2 3 --cycle 50 --algo greedy
-    python run_cqf.py --tc 1 --cycle 50 --algo random --seed 0 --order random
+    python run_cqf.py --tc 1 2 3 --cycle 50 --algo greedy_load
+    python run_cqf.py --tc 1 --cycle 50 --algo random --seed 0 --order random --order-seed 7
+    python run_cqf.py --tc 18 --cycle 50 --algo ppo --model results/ppo_T50
 
 参数说明见 --help。
 
@@ -39,9 +40,13 @@ def parse_args(argv=None):
     p.add_argument('--data-dir', default=DEFAULT_DATA_DIR, help='directory containing TC*_topo.txt / TC*_flows.txt')
     p.add_argument('--results-dir', default=DEFAULT_RESULTS_DIR, help='directory for result files')
     p.add_argument('--cycle', type=int, required=True, help='cycle length T in microseconds; must divide every flow period')
-    p.add_argument('--algo', default='greedy', choices=['random', 'greedy'], help='scheduling algorithm')
+    p.add_argument('--algo', default='greedy', choices=['random', 'greedy', 'greedy_load', 'ppo'],
+                   help='scheduling algorithm (greedy: smallest latency first; greedy_load: least loaded slot first)')
+    p.add_argument('--model', default=None, help='for --algo ppo: directory with model.zip / best_model.zip and config.json')
     p.add_argument('--order', default='input', choices=['input', 'deadline', 'random'], help='flow processing order')
-    p.add_argument('--seed', type=int, default=0, help='seed for the random scheduler and random ordering')
+    p.add_argument('--seed', type=int, default=0, help='seed for the random scheduler')
+    p.add_argument('--order-seed', type=int, default=None,
+                   help='seed for --order random (default: --seed + 10000, so ordering and scheduler use different streams)')
     p.add_argument('--k-paths', type=int, default=5, help='number of candidate shortest paths per flow (gasa uses 5)')
     p.add_argument('--max-offset', type=int, default=None, help='upper bound on the offset in cycles (default: period - 1)')
     p.add_argument('--bw-fraction', type=float, default=0.9, help='fraction of the link bandwidth usable by CQF traffic')
@@ -75,8 +80,10 @@ def run_one(tc, args):
                      k_paths=args.k_paths, max_offset_cycles=args.max_offset,
                      count_source_link=args.count_source_link)
 
-    ordered = order_streams(streams, args.order, random.Random(args.seed))
-    scheduler = make_scheduler(args.algo, seed=args.seed)
+    # 流顺序与算法用两个独立的随机数发生器：默认 order_seed = seed + 10000，不再共用同一个序列
+    order_seed = args.order_seed if args.order_seed is not None else args.seed + 10000
+    ordered = order_streams(streams, args.order, random.Random(order_seed))
+    scheduler = make_scheduler(args.algo, seed=args.seed, **({'model_path': args.model} if args.algo == 'ppo' else {}))
     result = scheduler.run(model, ordered)
     t_stop = time.time()
 
@@ -118,9 +125,9 @@ def run_one(tc, args):
     export.write_queue_sidecar(args.results_dir, run_name, model, simulation['queues'])
     export.write_time_file(args.results_dir, tc, t_start, t_stop, run_name)
     export.write_summary(args.results_dir, run_name, tc, model, result, t_stop - t_start, extra={
-        'algorithm': args.algo, 'order': args.order, 'seed': args.seed, 'k_paths': args.k_paths,
+        'algorithm': args.algo, 'order': args.order, 'seed': args.seed, 'order_seed': order_seed, 'k_paths': args.k_paths,
         'max_offset': args.max_offset, 'bw_fraction': args.bw_fraction,
-        'count_source_link': args.count_source_link,
+        'count_source_link': args.count_source_link, 'model': args.model,
         'verify_ok (ledger)': verification['ok'], 'simulate_ok (independent)': simulation['ok'],
     })
     print(summary_line)

@@ -23,7 +23,7 @@ import unittest
 from cqf.data_io import parse_topology, parse_flows, Stream
 from cqf.network import build_graph
 from cqf.model import CqfModel, REASON_DEADLINE, REASON_CAPACITY, REASON_NO_PATH
-from cqf.algorithms import GreedyScheduler, RandomScheduler, order_streams
+from cqf.algorithms import GreedyScheduler, LoadGreedyScheduler, RandomScheduler, order_streams
 from cqf.validate import simulate_and_validate
 
 TOPO_LINES = [
@@ -401,7 +401,7 @@ class TestVerifyAndAlgorithms(unittest.TestCase):
         self.assertTrue(simulate_and_validate(model)['ok'])
 
     def test_random_and_greedy_pass_verify_and_are_reproducible(self):
-        for cls in (RandomScheduler, GreedyScheduler):
+        for cls in (RandomScheduler, GreedyScheduler, LoadGreedyScheduler):
             results = []
             for _ in range(2):
                 model, streams = make_model(self._many_flows())
@@ -419,6 +419,29 @@ class TestVerifyAndAlgorithms(unittest.TestCase):
         self.assertEqual(model.assignments[a.id].path_idx, 0)
         self.assertEqual(model.assignments[a.id].offset, 0)
         self.assertEqual(res.rejected, {})
+
+    def test_load_greedy_avoids_the_busy_slot(self):
+        # 两条同源同宿的流：greedy 把第二条也放到 offset 0（时延最小，槽还放得下）；
+        # greedy_load 看到 offset 0 的槽已有 3000 字节，改选负载最低里时延最小的 (路径0, offset1)
+        lines = [flow(0, 'esA', 'esB', 1000, 800, 3000), flow(1, 'esA', 'esB', 1000, 800, 3000)]
+        model, (a, b) = make_model(lines)
+        GreedyScheduler().run(model, [a, b])
+        self.assertEqual((model.assignments[b.id].path_idx, model.assignments[b.id].offset), (0, 0))
+        model, (a, b) = make_model(lines)
+        LoadGreedyScheduler().run(model, [a, b])
+        self.assertEqual((model.assignments[a.id].path_idx, model.assignments[a.id].offset), (0, 0))
+        self.assertEqual((model.assignments[b.id].path_idx, model.assignments[b.id].offset), (0, 1))
+        self.assertTrue(model.verify()['ok'])
+
+    def test_feasible_counts_are_recorded(self):
+        model, (a, b, c) = make_model([flow(0, 'esA', 'esB', 1000, 800, 6000),
+                                       flow(1, 'esA', 'esB', 1000, 300, 6000),
+                                       flow(2, 'esA', 'esB', 1000, 250, 500)])
+        res = GreedyScheduler().run(model, [a, b, c])
+        # a：2 条路径 × 10 个 offset 里，deadline 8 cycle：路径0 offset<=5（1+2+o<=8）6 个，路径1 offset<=4 5 个 -> 11
+        self.assertEqual(res.feasible_counts[a.id], 11)
+        self.assertEqual(res.feasible_counts[b.id], 0)
+        self.assertEqual(res.feasible_counts[c.id], 0)
 
     def test_rejection_reasons(self):
         model, (a, b, c) = make_model([flow(0, 'esA', 'esB', 1000, 800, 6000),

@@ -1,11 +1,12 @@
 # CQF joint routing and offset scheduling
 
 Code of the Bachelor's thesis *GAT-based deep reinforcement learning for joint optimization of routing and scheduling in Time-Sensitive Networking*.
-This stage contains the scheduling kernel and baseline algorithms for Cyclic Queuing and Forwarding (CQF); the learned policy is added in later stages.
+It contains the scheduling kernel, the rule-based baselines and the reinforcement-learning part (MaskablePPO with an MLP or a
+GAT policy) for Cyclic Queuing and Forwarding (CQF).
 Given a topology, a set of periodic flows and a cycle length T, the scheduler decides for every flow a **route**
 (index into a set of candidate shortest paths) and an **offset** (injection delay in cycles), with the goal of
-maximizing the number of admitted flows. Random and greedy baselines are implemented; the algorithm interface is
-designed so that a learned policy can be plugged in later.
+maximizing the number of admitted flows. The random and greedy baselines and the trained policy all run through the same
+algorithm interface and the same validation and export path.
 
 The system model (input format, candidate paths, per-hop timing, delay and bandwidth constraints, output format)
 follows the GASA Multi-CQF implementation, reduced here to plain CQF with two alternating queues:
@@ -23,16 +24,25 @@ follows the GASA Multi-CQF implementation, reduced here to plain CQF with two al
 ```
 .
 ├── run_cqf.py                  entry point: load test case -> schedule -> validate -> export
+├── run_baselines.py            runs the random / greedy baselines with several seeds and tabulates them
+├── run_comparison.py           random / greedy / greedy_load / MLP / GAT at one cycle time and flow order, one table
 ├── cqf/
 │   ├── data_io.py              parse topology / flow files (GASA format) into Stream objects
 │   ├── network.py              Vertex / Link / Graph, k shortest candidate paths
 │   ├── model.py                CQF kernel: check / commit / release / feasible_actions / verify
 │   ├── validate.py             independent cycle-by-cycle simulation used to validate every schedule
 │   ├── export.py               result files in GASA format plus a per-instance queue file and a summary
-│   └── algorithms/
-│       ├── base.py             SchedulerBase (admit flows one by one), flow ordering
-│       ├── random_scheduler.py
-│       └── greedy_scheduler.py
+│   ├── algorithms/
+│   │   ├── base.py             SchedulerBase (admit flows one by one), flow ordering
+│   │   ├── random_scheduler.py
+│   │   ├── greedy_scheduler.py  greedy (smallest latency first) and greedy_load (least loaded slot first)
+│   │   └── ppo_scheduler.py    runs a trained MaskablePPO policy through the same interface
+│   └── rl/
+│       ├── features.py         vectorised action mask and observation (numpy), mirrors the kernel ledger
+│       ├── env.py              Gymnasium environment: one episode = one test case, flows in a given order
+│       ├── graph_obs.py        graph observation (nodes, directed links with utilisation profiles, candidate paths)
+│       ├── gat.py              GAT encoder used as the policy's feature extractor (plain torch, no PyG)
+│       └── train.py            MaskablePPO training script (sb3-contrib), --policy mlp | gat
 └── tests/                      unit tests with hand-checkable toy cases
 ```
 
@@ -40,7 +50,12 @@ Comments in the source are written in Chinese.
 
 ## Requirements
 
-Python 3.10 or newer. Only the standard library is used.
+Python 3.10 or newer. The kernel, the baselines and their tests use only the standard library.
+The reinforcement-learning part (`cqf/rl/`, `--algo ppo`) additionally needs
+
+```bash
+pip install numpy gymnasium torch stable-baselines3 sb3-contrib
+```
 
 ## Input data
 
@@ -50,18 +65,67 @@ from `../TCs_for_TSN/SA_TCs` relative to this directory; use `--data-dir` to poi
 ## Usage
 
 ```bash
-python run_cqf.py --tc 1 2 3 --cycle 50 --algo greedy
+python run_cqf.py --tc 1 2 3 --cycle 50 --algo greedy_load
 python run_cqf.py --tc 2 --cycle 50 --algo random --seed 0 --order random
-python -m unittest tests.test_model tests.test_run_cqf -v
+python run_baselines.py --tc 1 2 3 5 9 11 13 18 25 26 --cycle 50 --seeds 5   # baseline table, mean ± std over seeds
+python run_comparison.py --cycle 50 --order input --mlp results/mlp_T50_input --gat results/gat_T50_input   # full comparison table
+python -m unittest tests.test_model tests.test_run_cqf tests.test_rl_env -v
 ```
+
+Baselines: `random` picks a feasible (route, offset) pair uniformly; `greedy` takes the pair with the smallest
+end-to-end latency and breaks ties by the load of the busiest slot it would use; `greedy_load` reverses the two
+criteria (least loaded slot first, then smallest latency), which spreads flows over the hyperperiod instead of
+piling them into the earliest cycles. Every summary file reports the mask density: the mean over flows of
+feasible / candidate (route, offset) pairs at the moment the flow was processed, plus the number of flows that had
+no feasible pair at all.
+
+Reinforcement learning (MaskablePPO, MLP or GAT policy):
+
+```bash
+python -m cqf.rl.train --cycle 50 --train-tc 2 --val-tc 2 --timesteps 2000 --out results/ppo_smoke   # smoke test, a few seconds
+python -m cqf.rl.train --cycle 50 --order input --timesteps 1000000 --n-envs 16 --gamma 0.999 --batch-size 256 --net 256 256 --ent-coef 0.001 --lr-linear --eval-freq 40000 --seed 0 --out results/mlp_T50_input                                           # MLP policy, train on TC5/9/13, validate on TC11
+python -m cqf.rl.train --cycle 50 --policy gat --order deadline --timesteps 1000000 --n-envs 16 --gamma 0.999 --batch-size 256 --net 256 256 --ent-coef 0.001 --lr-linear --eval-freq 40000 --seed 0 --out results/gat_T50_deadline                                        # GAT policy
+python run_cqf.py --tc 18 25 26 --cycle 50 --order deadline --algo ppo --model results/gat_T50_deadline
+```
+
+The second and third commands are the settings of the comparison runs made so far in this project (1 M steps,
+16 environments, gamma 0.999, batch 256, 256x256 head, entropy coefficient 0.001, linearly decaying learning rate,
+validation every 40 000 steps); which experiments will go into the thesis has not been decided. The PPO defaults of
+`train.py` are the stable-baselines3 defaults (gamma 0.99, batch 64, 64x64 head, no entropy bonus, constant learning
+rate) with 200 000 steps, 8 environments and validation every 20 000 steps. A single-factor check on the validation
+case showed no measurable difference between the two settings. Every run writes its actual values to `config.json`.
+
+With `--policy gat` the observation is the whole topology: every node (switch / end station, degree, source or
+destination of the current flow, number of candidate paths through it) and every directed link (binned utilisation
+profile over the hyperperiod, mean / max / near-full share, number of candidate paths using it), padded to fixed
+sizes (`--max-nodes`, `--max-links`, `--max-path-links`) so that one network can be trained on small topologies and
+evaluated on larger ones. A graph attention encoder with edge features (`cqf/rl/gat.py`) produces one embedding per
+candidate path and one for the whole graph; these are appended to the vector observation of the MLP policy and fed
+to the same MLP head, so the two policies differ only in the encoder.
+
+Training runs `--n-envs` environments in parallel (default 8, one process each; `--vec dummy` keeps them in one
+process) and uses the GPU when `torch.cuda.is_available()` (`--device auto`). The CPU-only torch wheel works but is
+several times slower for the GAT policy; on an NVIDIA GPU install the matching CUDA build from
+https://download.pytorch.org/whl/ instead.
+
+The policy decides, for each flow in turn, one of `k_paths × n_offsets` actions (route index, offset); infeasible
+actions are masked out using the same rules as the kernel. The reward of a decision is +1 minus the number of
+flows that become unschedulable before the next decision (`--reject-penalty`, 0 gives plain +1 per admitted flow),
+so an episode return equals admitted minus rejected flows (flows that are already infeasible at the start of the
+episode are not counted). `train.py` writes
+`model.zip`, `best_model.zip` (best validation return) and `config.json`; `--algo ppo` checks that the model was
+trained with the same cycle length, candidate path count, capacity, source-link setting, offset range and
+observation size as the current run.
 
 | Option | Meaning | Default |
 |---|---|---|
 | `--tc` | test case numbers (one or more) | required |
 | `--cycle` | cycle length T in microseconds; must divide every flow period | required |
-| `--algo` | `random` or `greedy` | `greedy` |
+| `--algo` | `random`, `greedy`, `greedy_load` or `ppo` | `greedy` |
+| `--model` | for `--algo ppo`: directory with `model.zip` / `best_model.zip` and `config.json` | |
 | `--order` | flow processing order: `input`, `deadline`, `random` | `input` |
-| `--seed` | seed for the random scheduler and random ordering | `0` |
+| `--seed` | seed for the random scheduler | `0` |
+| `--order-seed` | seed for `--order random`; defaults to `--seed + 10000` so that ordering and scheduler draw from different streams | |
 | `--k-paths` | number of candidate shortest paths per flow | `5` |
 | `--max-offset` | upper bound on the offset in cycles | period − 1 |
 | `--bw-fraction` | fraction of the 1 Gbps link usable by CQF traffic | `0.9` |
