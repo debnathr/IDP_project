@@ -284,6 +284,40 @@ class TestGraphObsAndGat(unittest.TestCase):
         o4['link_x'][int(obs['path_links'][0, 0]), 0] = 1.0
         self.assertFalse(torch.allclose(base, run(o4), atol=1e-5))
 
+    def test_gat_ablation_switches(self):
+        import torch
+        from cqf.rl.gat import GatExtractor
+        model, _ = make_model(TOY_FLOWS)
+        env = CqfEnv([model], order='input', obs_mode='graph', graph_kwargs=self.GRAPH)
+        env.reset()
+        env.step(int(np.flatnonzero(env.action_masks())[0]))
+        obs = env.obs
+        changed = dict(obs)
+        changed['link_x'] = obs['link_x'].copy()
+        changed['link_x'][int(obs['path_links'][0, 0]), 0] = 1.0     # 改一条有效链路的特征
+        n_flat, dim, k = obs['actions'].shape[0], 8, env.k_paths
+
+        def run(net, o):
+            with torch.no_grad():
+                return net({key: torch.as_tensor(v, dtype=torch.float32)[None] for key, v in o.items()})
+
+        # no-edge：链路特征不起作用，改它输出不变；路径嵌入与全图嵌入仍然非零（来自节点特征）
+        torch.manual_seed(0)
+        net = GatExtractor(env.observation_space, dim=dim, heads=2, layers=2, ablation='no-edge').eval()
+        out = run(net, obs)
+        self.assertTrue(torch.equal(out, run(net, changed)))
+        self.assertGreater(float(out[0, n_flat:].abs().sum()), 0.0)
+        # no-path：输出 = [扁平观测, 全图嵌入, k 条路径嵌入] 里路径嵌入那一段全是 0，全图嵌入不是
+        torch.manual_seed(0)
+        net = GatExtractor(env.observation_space, dim=dim, heads=2, layers=2, ablation='no-path').eval()
+        out = run(net, obs)
+        self.assertEqual(out.shape, (1, n_flat + dim + k * dim))
+        self.assertEqual(float(out[0, n_flat + dim:].abs().sum()), 0.0)
+        self.assertGreater(float(out[0, n_flat:n_flat + dim].abs().sum()), 0.0)
+        self.assertFalse(torch.equal(out, run(net, changed)))        # 链路特征仍然通过全图嵌入起作用
+        with self.assertRaises(ValueError):
+            GatExtractor(env.observation_space, dim=dim, heads=2, ablation='no-such-thing')
+
     def test_gat_learn_save_and_schedule(self):
         from sb3_contrib import MaskablePPO
         from cqf.rl.gat import GatExtractor
@@ -338,6 +372,180 @@ class TestTrainScript(unittest.TestCase):
                 result = PpoScheduler(model_path=out).run(fresh, order_streams(streams, 'input'))
                 self.assertEqual(len(result.scheduled), len(fresh.assignments))
                 self.assertTrue(simulate_and_validate(fresh)['ok'])
+
+
+@unittest.skipUnless(HAVE_RL and HAVE_SB3, 'sb3_contrib not installed')
+class TestScorePolicy(unittest.TestCase):
+    """逐动作共享打分的策略（cqf.rl.score）。"""
+
+    def test_action_features_by_hand(self):
+        import torch
+        from cqf.rl.score import action_features
+        # k=2 条路径，n=4 个 offset。流：周期 2 个 cycle，deadline 4 个 cycle，帧长 0.2 个容量，进度 0.25；
+        # 两条路径的交换机数是 1 和 2，所以 hops/D = 0.25 和 0.5
+        loads = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+        obs = torch.tensor([[2 / 4, 4 / 4, 0.2, 0.25, 0.25, 0.5] + loads])
+        x = action_features(obs, 2, 4)
+        self.assertEqual(tuple(x.shape), (1, 2, 4, 8))
+        # 动作 (路径 1, offset 3)：load 0.8；hops/10 = 0.2；o/P = 3/2；e2e/D = (1 + 2 + 3)/4；后 4 个是流特征
+        expected = [0.8, 0.2, 1.5, 1.5, 0.5, 1.0, 0.2, 0.25]
+        for got, want in zip(x[0, 1, 3].tolist(), expected):
+            self.assertAlmostEqual(got, want, places=5)
+        # 动作 (路径 0, offset 0)：load 0.1；hops/10 = 0.1；o/P = 0；e2e/D = (1 + 1 + 0)/4
+        for got, want in zip(x[0, 0, 0, :4].tolist(), [0.1, 0.1, 0.0, 0.5]):
+            self.assertAlmostEqual(got, want, places=5)
+
+    def test_linear_scorer_follows_the_rule_it_encodes(self):
+        """把打分网络设成一个线性函数：分数 = -(1000 * hops/10 + load)。取分数最高的可行动作，
+        就应该是"交换机数最少的路径里、接纳后最忙槽负载最低的动作"（相同时取编号最小的）。掩码外的动作概率必须是 0。"""
+        import torch
+        from sb3_contrib import MaskablePPO
+        from cqf.rl.score import ScorePolicy
+        model, streams = make_model(TOY_FLOWS)
+        env = CqfEnv([model], strict=True)
+        k, n = env.k_paths, env.n_offsets
+        algo = MaskablePPO(ScorePolicy, env, n_steps=16, batch_size=16, seed=0, verbose=0, device='cpu',
+                           policy_kwargs=dict(k_paths=k, n_offsets=n, score_hidden=[]))
+        layer = algo.policy.mlp_extractor.score_net[-1]
+        with torch.no_grad():
+            layer.weight.zero_()
+            layer.bias.zero_()
+            layer.weight[0, 0] = -1.0          # load
+            layer.weight[0, 1] = -1000.0       # hops / 10
+        obs, _ = env.reset()
+        steps = 0
+        while env.stream is not None:
+            mask = env.action_masks()
+            hops = np.repeat(obs[4:4 + k], n)                      # 同一条流的 deadline 相同，hops/D 的大小顺序就是 hops 的顺序
+            loads = obs[4 + k:]
+            feasible = np.flatnonzero(mask)
+            best = feasible[np.lexsort((feasible, loads[feasible], hops[feasible]))[0]]
+            action, _ = algo.predict(obs, action_masks=mask, deterministic=True)
+            self.assertEqual(int(action), int(best))
+            dist = algo.policy.get_distribution(torch.as_tensor(obs[None]), action_masks=mask[None])
+            self.assertEqual(float(dist.distribution.probs[0][~torch.as_tensor(mask)].sum()), 0.0)
+            obs, _, _, _, _ = env.step(int(action))
+            steps += 1
+        self.assertGreater(steps, 0)
+
+    def test_rule_prior_gives_the_rule_before_any_training(self):
+        """有规则先验、还没训练时（打分网络最后一层是 0），取分数最高的可行动作就是
+        "交换机数最少的路径里、接纳后最忙槽负载最低的动作"（相同时取编号最小的）。"""
+        from sb3_contrib import MaskablePPO
+        from cqf.rl.score import ScorePolicy
+        model, streams = make_model(TOY_FLOWS)
+        env = CqfEnv([model], strict=True)
+        k, n = env.k_paths, env.n_offsets
+        algo = MaskablePPO(ScorePolicy, env, n_steps=16, batch_size=16, seed=0, verbose=0, device='cpu',
+                           policy_kwargs=dict(k_paths=k, n_offsets=n, prior_beta=20.0))
+        obs, _ = env.reset()
+        steps = 0
+        while env.stream is not None:
+            mask = env.action_masks()
+            hops = np.repeat(obs[4:4 + k], n)
+            loads = obs[4 + k:]
+            feasible = np.flatnonzero(mask)
+            best = feasible[np.lexsort((feasible, loads[feasible], hops[feasible]))[0]]
+            action, _ = algo.predict(obs, action_masks=mask, deterministic=True)
+            self.assertEqual(int(action), int(best))
+            obs, _, _, _, _ = env.step(int(action))
+            steps += 1
+        self.assertGreater(steps, 0)
+
+    def test_train_main_gat_score_policy(self):
+        from cqf.rl import train
+        from cqf.algorithms.ppo_scheduler import PpoScheduler
+        from tests.test_model import TOPO_LINES
+        with tempfile.TemporaryDirectory() as d:
+            data = os.path.join(d, 'data')
+            os.makedirs(data)
+            with open(os.path.join(data, 'TC1_topo.txt'), 'w', encoding='utf-8') as f:
+                f.write('\n'.join(TOPO_LINES) + '\n')
+            with open(os.path.join(data, 'TC1_flows.txt'), 'w', encoding='utf-8') as f:
+                f.write('\n'.join(TOY_FLOWS) + '\n')
+            out = os.path.join(d, 'gat_score')
+            rc = train.main(['--cycle', str(T), '--data-dir', data, '--train-tc', '1', '--val-tc', '1', '--out', out,
+                             '--policy', 'gat_score', '--n-envs', '2', '--vec', 'dummy', '--timesteps', '64', '--n-steps', '32',
+                             '--batch-size', '16', '--n-epochs', '1', '--eval-freq', '32', '--device', 'cpu',
+                             '--max-nodes', '8', '--max-links', '16', '--max-path-links', '6', '--link-bins', '5',
+                             '--gat-dim', '8', '--gat-heads', '2'])
+            self.assertEqual(rc, 0)
+            fresh, streams = make_model(TOY_FLOWS)
+            scheduler = PpoScheduler(model_path=out)
+            # 每个动作的输入 = 8 个自己的特征 + 路径嵌入 8 维 + 全图嵌入 8 维
+            self.assertEqual(scheduler.policy.policy.mlp_extractor.score_net[0].in_features, 8 + 2 * 8)
+            self.assertEqual(scheduler.policy.policy.features_extractor.ablation, 'none')
+            result = scheduler.run(fresh, order_streams(streams, 'input'))
+            self.assertEqual(len(result.scheduled), len(fresh.assignments))
+            self.assertTrue(simulate_and_validate(fresh)['ok'])
+
+            # 消融开关与层数写进 config.json，并随模型一起保存
+            ablated = os.path.join(d, 'gat_score_no_edge')
+            rc = train.main(['--cycle', str(T), '--data-dir', data, '--train-tc', '1', '--val-tc', '1', '--out', ablated,
+                             '--policy', 'gat_score', '--n-envs', '2', '--vec', 'dummy', '--timesteps', '64', '--n-steps', '32',
+                             '--batch-size', '16', '--n-epochs', '1', '--eval-freq', '32', '--device', 'cpu',
+                             '--max-nodes', '8', '--max-links', '16', '--max-path-links', '6', '--link-bins', '5',
+                             '--gat-dim', '8', '--gat-heads', '2', '--gat-layers', '1', '--gat-ablation', 'no-edge',
+                             '--score-prior', '20'])
+            self.assertEqual(rc, 0)
+            with open(os.path.join(ablated, 'config.json'), encoding='utf-8') as f:
+                config = json.load(f)
+            self.assertEqual(config['gat'], {'dim': 8, 'heads': 2, 'layers': 1, 'ablation': 'no-edge'})
+            self.assertEqual(config['score_prior'], 20.0)
+            extractor = PpoScheduler(model_path=ablated).policy.policy.features_extractor
+            self.assertEqual((extractor.ablation, len(extractor.layers)), ('no-edge', 1))
+
+            # run_comparison 的 --policy：同一个列名给两个模型文件 -> 一列，单元格是两次的均值 ± 标准差
+            import run_comparison
+            table = os.path.join(d, 'cmp.md')
+            rc = run_comparison.main(['--tc', '1', '--cycle', str(T), '--seeds', '1', '--test-tc', '1', '--data-dir', data,
+                                      '--results-dir', os.path.join(d, 'results'), '--out', table,
+                                      '--policy', 'S=' + os.path.join(out, 'model.zip'),
+                                      '--policy', 'S=' + os.path.join(ablated, 'model.zip')])
+            self.assertEqual(rc, 0)
+            with open(table, encoding='utf-8') as f:
+                text = f.read()
+            self.assertIn('| TC | role | flows | random | greedy | greedy_load | hops_load | S |', text)
+            row = [line for line in text.splitlines() if line.startswith('| 1 | test |')][0]
+            self.assertIn(' ± ', row.split('|')[-2])
+
+    def test_parameter_count_does_not_depend_on_action_count(self):
+        from cqf.rl.score import ScoreExtractor
+        small = ScoreExtractor(4 + 5 + 5 * 10, 5, 10, [32, 32], [64])
+        large = ScoreExtractor(4 + 5 + 5 * 250, 5, 250, [32, 32], [64])
+
+        def count(module):
+            return sum(p.numel() for p in module.score_net.parameters())
+        self.assertEqual(count(small), count(large))
+        self.assertEqual(count(small), 8 * 32 + 32 + 32 * 32 + 32 + 32 + 1)
+
+    def test_train_main_score_policy(self):
+        from cqf.rl import train
+        from cqf.algorithms.ppo_scheduler import PpoScheduler
+        from tests.test_model import TOPO_LINES
+        with tempfile.TemporaryDirectory() as d:
+            data = os.path.join(d, 'data')
+            os.makedirs(data)
+            with open(os.path.join(data, 'TC1_topo.txt'), 'w', encoding='utf-8') as f:
+                f.write('\n'.join(TOPO_LINES) + '\n')
+            with open(os.path.join(data, 'TC1_flows.txt'), 'w', encoding='utf-8') as f:
+                f.write('\n'.join(TOY_FLOWS) + '\n')
+            out = os.path.join(d, 'score')
+            rc = train.main(['--cycle', str(T), '--data-dir', data, '--train-tc', '1', '--val-tc', '1', '--out', out,
+                             '--policy', 'score', '--n-envs', '2', '--vec', 'dummy', '--timesteps', '64', '--n-steps', '32',
+                             '--batch-size', '16', '--n-epochs', '1', '--eval-freq', '32', '--device', 'cpu'])
+            self.assertEqual(rc, 0)
+            with open(os.path.join(out, 'config.json'), encoding='utf-8') as f:
+                config = json.load(f)
+            self.assertEqual((config['policy'], config['score_net'], config['score_prior']), ('score', [32, 32], 0.0))
+            fresh, streams = make_model(TOY_FLOWS)
+            result = PpoScheduler(model_path=out).run(fresh, order_streams(streams, 'input'))
+            self.assertEqual(len(result.scheduled), len(fresh.assignments))
+            self.assertTrue(simulate_and_validate(fresh)['ok'])
+            # 保存再加载：同一个用例重跑一遍，决策必须完全相同
+            again, streams = make_model(TOY_FLOWS)
+            PpoScheduler(model_path=out).run(again, order_streams(streams, 'input'))
+            self.assertEqual(fresh.assignments, again.assignments)
 
 
 @unittest.skipUnless(HAVE_RL and HAVE_SB3, 'sb3_contrib not installed')

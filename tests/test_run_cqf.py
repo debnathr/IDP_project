@@ -54,6 +54,10 @@ class TestRunCqf(unittest.TestCase):
         self.assertIn('mask density', text)
         self.assertIn('order_seed: 10000', text)          # 默认 order_seed = seed + 10000
 
+    def test_hops_load_runs_through_the_same_checks(self):
+        self.assertEqual(run_cqf.main(self._argv('--algo', 'hops_load', '--order', 'deadline')), 0)
+        self.assertTrue(any(n.startswith('summary_') and '_hops_load_deadline_' in n for n in self._files()))
+
     def test_order_seed_is_independent_of_scheduler_seed(self):
         # 随机顺序只由 order_seed 决定：默认 seed + 10000，显式给 --order-seed 时用它
         import random
@@ -105,7 +109,7 @@ class TestRunCqf(unittest.TestCase):
 
 
 class TestRunComparison(unittest.TestCase):
-    """run_comparison.py：随机（多 seed）/ 贪心 / 负载贪心在玩具用例上跑齐，写出 Markdown 表与 csv。不给 --mlp / --gat 时没有策略列。"""
+    """run_comparison.py：随机（多 seed）与三个贪心规则在玩具用例上跑齐，写出 Markdown 表与 csv。不给策略时没有策略列。"""
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -127,13 +131,13 @@ class TestRunComparison(unittest.TestCase):
         self.assertEqual(rc, 0)
         with open(out, encoding='utf-8') as f:
             text = f.read()
-        self.assertIn('| 1 | test | 2 | 2.0 ± 0.0 | 2 | 2 |', text)          # 两条玩具流全部接纳
-        self.assertIn('| **test total** | **1** | **2** |', text)             # --test-tc 1 -> 有加总行
+        self.assertIn('| 1 | test | 2 | 2.0 ± 0.0 | 2 | 2 | 2 |', text)      # 两条玩具流全部接纳
+        self.assertIn('| **test total** | **1** | **2** | **2.0 ± 0.0** | **2** | **2** | **2** |', text)   # 有加总行
         self.assertNotIn('MLP (PPO)', text)
         with open(os.path.join(self.tmp, 'cmp.csv'), encoding='utf-8') as f:
             rows = list(csv.DictReader(f))
-        self.assertEqual([r['label'] for r in rows], ['random', 'random', 'greedy', 'greedy_load'])
-        self.assertEqual([r['seed'] for r in rows], ['0', '1', '0', '0'])
+        self.assertEqual([r['label'] for r in rows], ['random', 'random', 'greedy', 'greedy_load', 'hops_load'])
+        self.assertEqual([r['seed'] for r in rows], ['0', '1', '0', '0', '0'])
         self.assertTrue(all(r['order'] == 'input' for r in rows))
         self.assertTrue(any(n.startswith('summary_') and '_cmp' in n for n in os.listdir(self.results)))
 
@@ -144,8 +148,16 @@ class TestRunComparison(unittest.TestCase):
         self.assertEqual(rc, 0)
         with open(out, encoding='utf-8') as f:
             text = f.read()
-        self.assertIn('| 1 | smoke | 2 | 2 | 2 | 2 |', text)                  # 单 seed 时随机列不带 ±
+        self.assertIn('| 1 | smoke | 2 | 2 | 2 | 2 | 2 |', text)              # 单 seed 时随机列不带 ±
         self.assertNotIn('test total', text)
+
+    def test_policy_option_needs_label_and_path(self):
+        for bad in ('no_equal_sign', '=path', 'label=', 'greedy=some/path'):   # 最后一个：列名与基线列重名
+            with self.assertRaises(ValueError):
+                run_comparison.make_columns(run_comparison.parse_args(['--cycle', '100', '--policy', bad]))
+        columns = run_comparison.make_columns(run_comparison.parse_args(
+            ['--cycle', '100', '--seeds', '1', '--policy', 'A=x/model.zip', '--policy', 'B=y', '--policy', 'A=z/model.zip']))
+        self.assertEqual(columns[-2:], [('A', 'ppo', [(0, 'x/model.zip'), (1, 'z/model.zip')]), ('B', 'ppo', [(0, 'y')])])
 
 
 if __name__ == '__main__':

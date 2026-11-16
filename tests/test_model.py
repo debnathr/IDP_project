@@ -23,7 +23,7 @@ import unittest
 from cqf.data_io import parse_topology, parse_flows, Stream
 from cqf.network import build_graph
 from cqf.model import CqfModel, REASON_DEADLINE, REASON_CAPACITY, REASON_NO_PATH
-from cqf.algorithms import GreedyScheduler, LoadGreedyScheduler, RandomScheduler, order_streams
+from cqf.algorithms import GreedyScheduler, LoadGreedyScheduler, HopsLoadScheduler, RandomScheduler, order_streams
 from cqf.validate import simulate_and_validate
 
 TOPO_LINES = [
@@ -401,7 +401,7 @@ class TestVerifyAndAlgorithms(unittest.TestCase):
         self.assertTrue(simulate_and_validate(model)['ok'])
 
     def test_random_and_greedy_pass_verify_and_are_reproducible(self):
-        for cls in (RandomScheduler, GreedyScheduler, LoadGreedyScheduler):
+        for cls in (RandomScheduler, GreedyScheduler, LoadGreedyScheduler, HopsLoadScheduler):
             results = []
             for _ in range(2):
                 model, streams = make_model(self._many_flows())
@@ -432,6 +432,26 @@ class TestVerifyAndAlgorithms(unittest.TestCase):
         self.assertEqual((model.assignments[a.id].path_idx, model.assignments[a.id].offset), (0, 0))
         self.assertEqual((model.assignments[b.id].path_idx, model.assignments[b.id].offset), (0, 1))
         self.assertTrue(model.verify()['ok'])
+
+    def test_hops_load_keeps_the_short_path_and_balances_offsets(self):
+        lines = [flow(0, 'esA', 'esB', 1000, 800, 3000), flow(1, 'esA', 'esB', 1000, 800, 3000)]
+        # 1) offset 可选时：第二条流留在路径 0（2 台交换机），换到负载最低的 offset 1
+        model, (a, b) = make_model(lines)
+        HopsLoadScheduler().run(model, [a, b])
+        self.assertEqual((model.assignments[a.id].path_idx, model.assignments[a.id].offset), (0, 0))
+        self.assertEqual((model.assignments[b.id].path_idx, model.assignments[b.id].offset), (0, 1))
+        # 2) 只允许 offset 0 时两个规则分开：a 占了路径 0 的槽 (cycle 1, sw1->sw2) 与 (cycle 2, sw2->esB)。
+        #    路径 1 = esA,sw1,sw3,sw2,esB 在 offset 0 用的槽是 (1, sw1->sw3)、(2, sw3->sw2)、(3, sw2->esB)，全空。
+        #    greedy_load 负载在前：路径 1 的最忙槽 3000 字节 < 路径 0 的 6000 字节 -> 走路径 1（多占一条链路）；
+        #    hops_load 交换机数在前：仍走路径 0（6000 <= 11250，放得下）
+        model, (a, b) = make_model(lines, max_offset_cycles=0)
+        LoadGreedyScheduler().run(model, [a, b])
+        self.assertEqual((model.assignments[b.id].path_idx, model.assignments[b.id].offset), (1, 0))
+        model, (a, b) = make_model(lines, max_offset_cycles=0)
+        HopsLoadScheduler().run(model, [a, b])
+        self.assertEqual((model.assignments[b.id].path_idx, model.assignments[b.id].offset), (0, 0))
+        self.assertTrue(model.verify()['ok'])
+        self.assertTrue(simulate_and_validate(model)['ok'])
 
     def test_feasible_counts_are_recorded(self):
         model, (a, b, c) = make_model([flow(0, 'esA', 'esB', 1000, 800, 6000),

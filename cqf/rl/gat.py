@@ -7,6 +7,10 @@
     3. 读出：链路嵌入 = MLP([h_u, h_v, e_uv])；路径嵌入 = 该路径经过的链路嵌入的均值；全图嵌入 = 有效节点嵌入的均值；
     4. 输出特征 = [MLP 阶段的 'actions' 向量, 全图嵌入, k 条路径嵌入]，交给 sb3 的 MLP 头产生动作 logits 与价值。
 
+消融开关 ablation（只用于消融实验，默认 'none'）：
+    'no-edge'  链路特征全部置零：注意力打分、消息、链路嵌入里都没有链路自己的信息，只剩节点特征和拓扑；
+    'no-path'  路径嵌入全部置零：输出里只剩全图嵌入，各条候选路径得到的图信息相同。
+
 所有操作都是 gather / scatter，与节点、链路的编号顺序无关（置换不变），tests/test_rl_env.py 里专门检查这一点。
 不依赖 PyTorch Geometric，只用 torch 自带的 gather / scatter_add / scatter_reduce，便于逐行解释。
 """
@@ -72,10 +76,13 @@ class GatLayer(nn.Module):
 class GatExtractor(BaseFeaturesExtractor):
     """observation_space 是 graph_obs.GraphObs.space；输出维度 = len(actions) + dim + k_paths * dim。"""
 
-    def __init__(self, observation_space, dim=32, heads=4, layers=2):
+    def __init__(self, observation_space, dim=32, heads=4, layers=2, ablation='none'):
+        if ablation not in ('none', 'no-edge', 'no-path'):
+            raise ValueError('unknown GAT ablation %r, available: none, no-edge, no-path' % (ablation,))
         n_actions = observation_space['actions'].shape[0]
         self.k_paths = observation_space['path_links'].shape[0]
         super().__init__(observation_space, features_dim=n_actions + dim + self.k_paths * dim)
+        self.ablation = ablation
         self.node_in = nn.Linear(observation_space['node_x'].shape[1], dim)
         self.link_in = nn.Linear(observation_space['link_x'].shape[1], dim)
         self.layers = nn.ModuleList([GatLayer(dim, heads) for _ in range(layers)])
@@ -86,6 +93,8 @@ class GatExtractor(BaseFeaturesExtractor):
         src, dst = obs['link_src'].long(), obs['link_dst'].long()         # sb3 把整数观测转成了 float，这里转回
         h = F.elu(self.node_in(obs['node_x'])) * node_valid[..., None]
         e = F.elu(self.link_in(obs['link_x'])) * link_valid[..., None]
+        if self.ablation == 'no-edge':
+            e = torch.zeros_like(e)                                         # 消融：链路特征不进入注意力、消息与链路嵌入
         for layer in self.layers:
             h = layer(h, e, src, dst, link_valid, node_valid)
         # 链路嵌入与路径池化
@@ -96,5 +105,7 @@ class GatExtractor(BaseFeaturesExtractor):
         B, k, P = path_links.shape
         pe = _gather_nodes(g, path_links.reshape(B, k * P)).reshape(B, k, P, -1)
         path_emb = (pe * path_mask).sum(2) / (path_mask.sum(2) + 1e-9)      # (B, k, dim)
+        if self.ablation == 'no-path':
+            path_emb = torch.zeros_like(path_emb)                           # 消融：只留全图嵌入
         graph_emb = (h * node_valid[..., None]).sum(1) / (node_valid.sum(1, keepdim=True) + 1e-9)
         return torch.cat([obs['actions'], graph_emb, path_emb.reshape(B, -1)], dim=1)

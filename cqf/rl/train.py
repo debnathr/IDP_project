@@ -2,7 +2,12 @@
 
 用法（在项目根目录）：
     python -m cqf.rl.train --cycle 50 --out results/ppo_T50
+    python -m cqf.rl.train --cycle 50 --policy gat_score --out results/gat_score_T50                     # 带 GAT 的逐动作打分
+    python -m cqf.rl.train --cycle 50 --policy gat_score --score-prior 20 --out results/gat_score_prior  # 再加规则先验
     python -m cqf.rl.train --cycle 50 --train-tc 2 --val-tc 2 --timesteps 2000 --out results/ppo_smoke   # 冒烟
+
+四种策略（--policy）：mlp、gat 是扁平策略头（整个观测 -> 隐层 -> 一个线性层输出全部动作的 logit）；
+score、gat_score 是逐动作共享打分头（见 score.py），gat_score 另把 GAT 的路径嵌入与全图嵌入交给每个动作。
 
 数据划分：训练 TC5、TC9、TC13；验证 TC11（早停 / 选 checkpoint，不参与梯度）；
 测试 TC18、TC25、TC26 只在最终评估时用 run_cqf.py --algo ppo 跑；TC1、TC2、TC3 用于冒烟。
@@ -27,6 +32,7 @@ from sb3_contrib.common.maskable.callbacks import MaskableEvalCallback
 
 from .env import CqfEnv, make_models, default_n_offsets
 from .gat import GatExtractor
+from .score import ScorePolicy
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_DATA_DIR = os.path.normpath(os.path.join(HERE, '..', '..', '..', 'TCs_for_TSN', 'SA_TCs'))
@@ -62,11 +68,21 @@ def parse_args(argv=None):
                    help='reward penalty per flow auto-rejected after a decision (0 = plain +1 per accepted flow)')
     p.add_argument('--net', type=int, nargs='+', default=[64, 64],
                    help='hidden layer sizes of the MLP head; sb3 default 64 64, the comparison runs so far used 256 256')
-    p.add_argument('--policy', default='mlp', choices=['mlp', 'gat'],
-                   help='mlp: vector observation; gat: graph observation + GAT encoder in front of the MLP head')
+    p.add_argument('--policy', default='mlp', choices=['mlp', 'gat', 'score', 'gat_score'],
+                   help='mlp: vector observation; gat: graph observation + GAT encoder in front of the MLP head; '
+                        'score: vector observation, one shared network scores every action from its own features; '
+                        'gat_score: like score, and every action also gets the GAT embedding of its path and of the graph')
+    p.add_argument('--score-net', type=int, nargs='*', default=[32, 32],
+                   help='hidden layer sizes of the shared scoring network (--policy score / gat_score)')
+    p.add_argument('--score-prior', type=float, default=0.0,
+                   help='--policy score / gat_score: add -beta * (hops + load) to every logit, so that training starts '
+                        'from the rule "fewest switches, then least loaded slot"; 0 = no prior')
     p.add_argument('--gat-dim', type=int, default=32, help='GAT embedding size')
     p.add_argument('--gat-heads', type=int, default=4)
     p.add_argument('--gat-layers', type=int, default=2)
+    p.add_argument('--gat-ablation', default='none', choices=['none', 'no-edge', 'no-path'],
+                   help='ablation of the GAT encoder; no-edge: link features are zeroed, '
+                        'no-path: path embeddings are zeroed (only the graph embedding is left)')
     p.add_argument('--max-nodes', type=int, default=128, help='graph observation: node slots (TC25/26 need 116)')
     p.add_argument('--max-links', type=int, default=256, help='graph observation: directed link slots (TC25/26 need 244)')
     p.add_argument('--max-path-links', type=int, default=20, help='graph observation: links per candidate path (data: <= 17)')
@@ -97,7 +113,7 @@ def main(argv=None):
 
     graph_kwargs = dict(max_nodes=args.max_nodes, max_links=args.max_links, max_path_links=args.max_path_links,
                         link_bins=args.link_bins)
-    obs_mode = 'graph' if args.policy == 'gat' else 'flat'
+    obs_mode = 'graph' if args.policy in ('gat', 'gat_score') else 'flat'
     env_fns = [functools.partial(make_train_env, i, args.data_dir, args.train_tc, kw, n_offsets, args.order, args.seed,
                                  args.tc_sampling, args.reject_penalty, obs_mode, graph_kwargs)
                for i in range(args.n_envs)]
@@ -113,7 +129,8 @@ def main(argv=None):
                   n_steps=args.n_steps, n_envs=args.n_envs, n_steps_per_env=n_steps_per_env, n_epochs=args.n_epochs,
                   batch_size=args.batch_size, lr=args.lr, ent_coef=args.ent_coef, net=args.net,
                   gamma=args.gamma, reject_penalty=args.reject_penalty, lr_linear=args.lr_linear,
-                  policy=args.policy, gat=dict(dim=args.gat_dim, heads=args.gat_heads, layers=args.gat_layers),
+                  score_net=args.score_net, score_prior=args.score_prior, policy=args.policy,
+                  gat=dict(dim=args.gat_dim, heads=args.gat_heads, layers=args.gat_layers, ablation=args.gat_ablation),
                   graph=graph_kwargs, n_actions=int(env.action_space.n),
                   obs_dim=int(val_env.get_wrapper_attr('features')[0].obs_dim))
     with open(os.path.join(args.out, 'config.json'), 'w', encoding='utf-8') as f:
@@ -122,10 +139,15 @@ def main(argv=None):
     # sb3 的 learning_rate 可以是函数：参数是"剩余训练进度"（1 -> 0）
     learning_rate = (lambda remaining: args.lr * remaining) if args.lr_linear else args.lr
     policy_kwargs = dict(net_arch=list(args.net))
-    if args.policy == 'gat':
+    if args.policy in ('gat', 'gat_score'):
         policy_kwargs.update(features_extractor_class=GatExtractor,
-                             features_extractor_kwargs=dict(dim=args.gat_dim, heads=args.gat_heads, layers=args.gat_layers))
-    algo = MaskablePPO('MultiInputPolicy' if args.policy == 'gat' else 'MlpPolicy', env, seed=args.seed,
+                             features_extractor_kwargs=dict(dim=args.gat_dim, heads=args.gat_heads, layers=args.gat_layers,
+                                                            ablation=args.gat_ablation))
+    policy_class = {'mlp': 'MlpPolicy', 'gat': 'MultiInputPolicy', 'score': ScorePolicy, 'gat_score': ScorePolicy}[args.policy]
+    if args.policy in ('score', 'gat_score'):
+        policy_kwargs.update(k_paths=args.k_paths, n_offsets=n_offsets, score_hidden=list(args.score_net),
+                             prior_beta=args.score_prior, graph_dim=args.gat_dim if args.policy == 'gat_score' else 0)
+    algo = MaskablePPO(policy_class, env, seed=args.seed,
                        n_steps=n_steps_per_env, batch_size=args.batch_size, n_epochs=args.n_epochs,
                        learning_rate=learning_rate, ent_coef=args.ent_coef, gamma=args.gamma,
                        policy_kwargs=policy_kwargs, verbose=1, device=args.device)

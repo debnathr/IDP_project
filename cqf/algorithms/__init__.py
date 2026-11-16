@@ -8,7 +8,8 @@
 
 from .base import SchedulerBase, ScheduleResult, order_streams
 from .random_scheduler import RandomScheduler
-from .greedy_scheduler import GreedyScheduler, LoadGreedyScheduler
+from .greedy_scheduler import GreedyScheduler, LoadGreedyScheduler, HopsLoadScheduler
+
 
 def _make_ppo(seed=None, **kwargs):
     from .ppo_scheduler import PpoScheduler
@@ -19,6 +20,7 @@ SCHEDULERS = {
     'random': RandomScheduler,
     'greedy': GreedyScheduler,
     'greedy_load': LoadGreedyScheduler,
+    'hops_load': HopsLoadScheduler,
     'ppo': _make_ppo,
 }
 

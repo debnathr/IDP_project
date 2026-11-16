@@ -5,7 +5,7 @@
     python run_baselines.py --tc 5 --cycle 50 --seeds 3 --out results/baselines_TC5.md
 
 每个用例跑：
-    确定性算法  greedy / greedy_load × 流顺序 input / deadline，各一次（seed 不影响结果）；
+    确定性算法  greedy / greedy_load / hops_load × 流顺序 input / deadline，各一次（seed 不影响结果）；
     随机算法    random × 流顺序 input / random，各 --seeds 次（seed 0..N-1；random 顺序的 order_seed = seed + 10000）。
 每次运行都走 run_cqf.run_one：同一套建模、两道验证和结果文件（文件名带 --tag）。
 表里给随机算法的均值 ± 样本标准差，另给 greedy/input 轨迹下的掩码密度（每条流可行组合数 / 候选组合数的均值）
@@ -25,7 +25,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import run_cqf                                              # noqa: E402
 from cqf.export import mask_density_stats                   # noqa: E402
 
-DETERMINISTIC = [('greedy', 'input'), ('greedy', 'deadline'), ('greedy_load', 'input'), ('greedy_load', 'deadline')]
+DETERMINISTIC = [('greedy', 'input'), ('greedy', 'deadline'), ('greedy_load', 'input'), ('greedy_load', 'deadline'),
+                 ('hops_load', 'input'), ('hops_load', 'deadline')]
 RANDOMIZED = [('random', 'input'), ('random', 'random')]
 
 

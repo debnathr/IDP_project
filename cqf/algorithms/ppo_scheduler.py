@@ -71,7 +71,8 @@ class PpoScheduler(SchedulerBase):
         if 'obs_dim' in self.config and int(self.config['obs_dim']) != self.features.obs_dim:
             raise ValueError('policy was trained with obs_dim=%d but the current features have obs_dim=%d'
                              % (int(self.config['obs_dim']), self.features.obs_dim))
-        self.graph_obs = GraphObs(self.features, **self.config['graph']) if self.policy_kind == 'gat' else None
+        uses_graph = self.policy_kind in ('gat', 'gat_score')
+        self.graph_obs = GraphObs(self.features, **self.config['graph']) if uses_graph else None
         ordered_streams = list(ordered_streams)
         self._position = {s.id: i / len(ordered_streams) for i, s in enumerate(ordered_streams)}
         return super().run(model, ordered_streams)

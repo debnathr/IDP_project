@@ -35,14 +35,17 @@ DEFAULT_RESULTS_DIR = os.path.join(HERE, 'results')
 
 
 def parse_args(argv=None):
-    p = argparse.ArgumentParser(description='CQF joint routing and offset scheduling (random / greedy baselines)')
+    p = argparse.ArgumentParser(description='CQF joint routing and offset scheduling (rule baselines or a trained policy)')
     p.add_argument('--tc', type=int, nargs='+', required=True, help='test case numbers, e.g. 1 2 3')
     p.add_argument('--data-dir', default=DEFAULT_DATA_DIR, help='directory containing TC*_topo.txt / TC*_flows.txt')
     p.add_argument('--results-dir', default=DEFAULT_RESULTS_DIR, help='directory for result files')
     p.add_argument('--cycle', type=int, required=True, help='cycle length T in microseconds; must divide every flow period')
-    p.add_argument('--algo', default='greedy', choices=['random', 'greedy', 'greedy_load', 'ppo'],
-                   help='scheduling algorithm (greedy: smallest latency first; greedy_load: least loaded slot first)')
-    p.add_argument('--model', default=None, help='for --algo ppo: directory with model.zip / best_model.zip and config.json')
+    p.add_argument('--algo', default='greedy', choices=['random', 'greedy', 'greedy_load', 'hops_load', 'ppo'],
+                   help='scheduling algorithm (greedy: smallest latency first; greedy_load: least loaded slot first; '
+                        'hops_load: fewest switches first, then least loaded slot)')
+    p.add_argument('--model', default=None,
+                   help='for --algo ppo: a model .zip file, or a directory (best_model.zip is used if present, else model.zip); '
+                        'config.json must be in the same directory')
     p.add_argument('--order', default='input', choices=['input', 'deadline', 'random'], help='flow processing order')
     p.add_argument('--seed', type=int, default=0, help='seed for the random scheduler')
     p.add_argument('--order-seed', type=int, default=None,
